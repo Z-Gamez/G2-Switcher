@@ -28,7 +28,12 @@ alone is ~40k tokens.
 **Requirements:** Windows 10/11, [Node.js](https://nodejs.org), and Even Terminal
 (`npm install -g @evenrealities/even-terminal`). Ollama only if you want local models.
 
-Build the exe (needs Python 3.10+):
+**Easiest:** download `G2-Switcher.exe` from the
+[latest release](https://github.com/Z-Gamez/G2-Switcher/releases/latest) and run it.
+It's unsigned, so Windows SmartScreen may warn you the first time — choose
+*More info → Run anyway*, or build it yourself below.
+
+**Build it yourself** (needs Python 3.10+):
 
 ```bat
 pip install -r requirements.txt pyinstaller
