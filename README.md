@@ -3,6 +3,24 @@
 A small Windows tray app that lets the **Even Realities G2** glasses' Terminal mode
 talk to whichever AI you pick — and switch between them mid-conversation, no restart.
 
+It's still **Claude Code** doing the work — file edits, terminal commands, permission
+prompts on your glasses, MCP servers, skills — G2 Switcher only swaps the model behind it.
+Pair it with a free OpenRouter model or a local Ollama model and you get the Claude Code
+agent without paying for a model.
+
+<p align="center">
+  <img src="docs/g2-switcher-ai-activity.png" width="400" alt="G2 Switcher with Ollama selected; the AI activity log shows Claude Code writing and opening an FPS game">
+  <img src="docs/g2-switcher-openrouter.png" width="400" alt="G2 Switcher's OpenRouter model browser with free and paid models, prices and starred favorites">
+</p>
+
+**Built with it:** this little raycaster FPS was written start to finish by Claude Code
+running on a local Qwen coder model (via Ollama on a 12 GB GPU), driven from the glasses.
+
+<p align="center">
+  <img src="docs/fps-demo.gif" width="480" alt="Gameplay of a DOOM-style raycasting FPS built by Claude Code on a local model">
+  <br><sub>Gameplay recorded with a small aim-bot script.</sub>
+</p>
+
 | Provider | What it uses |
 |---|---|
 | **Claude · API key** | Pay-as-you-go [Anthropic API](https://console.anthropic.com) credits |
