@@ -1,0 +1,18 @@
+# Personal data - never commit
+settings.json
+logs/
+*.key
+*.token
+*.log
+
+# Build output
+build/
+dist/
+*.spec
+g2switcher.ico
+
+# Python
+__pycache__/
+*.pyc
+*.bak
+.venv/
