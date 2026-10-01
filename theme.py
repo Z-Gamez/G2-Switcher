@@ -15,6 +15,7 @@ DIM = "#5e8a6b"       # secondary text
 GREEN = "#3dff7a"     # phosphor accent
 AMBER = "#ffbf3d"
 RED = "#ff6262"
+CYAN = "#5fd7ff"      # tool calls
 BLACK = "#000000"
 
 MONO_CHOICES = ("Cascadia Mono", "Cascadia Code", "JetBrains Mono", "Consolas", "Courier New")

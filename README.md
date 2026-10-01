@@ -7,7 +7,7 @@ talk to whichever AI you pick — and switch between them mid-conversation, no r
 |---|---|
 | **Claude · API key** | Pay-as-you-go [Anthropic API](https://console.anthropic.com) credits |
 | **Claude · subscription** | Your Claude Pro / Max plan, via a `claude setup-token` token |
-| **OpenRouter · free models** | Any `:free` model on [OpenRouter](https://openrouter.ai) |
+| **OpenRouter · any model** | Any free or paid [OpenRouter](https://openrouter.ai) model that supports tool calling |
 | **Ollama · local** | A model running on your own PC with [Ollama](https://ollama.com) |
 
 ## How it works
@@ -51,7 +51,18 @@ Or run from source: `pip install -r requirements.txt` then `pythonw app.py`.
 1. Pick a provider (click it or press **1–4**).
 2. Paste the key for it under **settings** and press **test**.
    - Claude subscription: run `claude setup-token` in a terminal and paste the `sk-ant-oat…` token.
+   - OpenRouter: filter the model list by **all / free / paid / starred**, search it, and click
+     ☆ (or right-click a model) to star favorites. Prices are per million tokens, in / out. Models
+     without tool calling, or with a context window too small for Claude Code, are hidden.
 3. Press **start** to launch Even Terminal, then open Terminal mode on your glasses.
+
+### Activity
+
+The **ai** tab shows what the model is doing while you wait on the glasses: what you asked,
+thinking, the text it writes, each tool it calls (file writes, commands, …), and errors. The bar
+above it is live: *waiting for the provider*, *thinking*, *writing*, *Claude Code is running a
+tool* — with a timer, and a hint if a provider has been silent for a while. The **system** tab
+has G2 Switcher's and Even Terminal's own log.
 
 Closing the window keeps G2 Switcher in the system tray — right-click the tray icon to
 switch providers, start/stop Even Terminal, or quit. Launching it again just brings the
@@ -91,6 +102,7 @@ except to the provider you select.
 | `app.py` | Tkinter UI and tray icon |
 | `backend.py` | Settings, keys, key tests, Even Terminal process |
 | `relay.py` | The local Anthropic-API relay |
+| `activity.py` | Reads the relayed traffic into the AI activity feed |
 | `theme.py` | Colors, fonts, app icon (`python theme.py` writes `g2switcher.ico`) |
 
 Not affiliated with Even Realities or Anthropic.

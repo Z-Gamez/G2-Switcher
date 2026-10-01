@@ -22,6 +22,8 @@ import threading
 import time
 import urllib.parse
 
+import activity
+
 PROVIDERS = {
     "claude": "https://api.anthropic.com",
     "claude_sub": "https://api.anthropic.com",
@@ -55,6 +57,7 @@ class State:
         self.keys = {p: "" for p in KEY_LABELS}
         self.log = lambda msg: None
         self.on_show = lambda: None  # a second G2 Switcher launch asks this one to show itself
+        self.on_ai = lambda event: None  # activity.Call events: what the model is doing
 
     def snapshot(self):
         with self.lock:
@@ -214,12 +217,21 @@ class RelayHandler(http.server.BaseHTTPRequestHandler):
         if not is_claude:
             path = path.replace("?beta=true", "").replace("&beta=true", "")
 
+        call = None
+        if isinstance(body, dict) and "messages" in body and "count_tokens" not in path:
+            # Claude Code uses its small/fast model for side jobs (titles, summaries, checks).
+            background = "haiku" in (asked_model or "").lower()
+            call = activity.Call(self.state.on_ai, provider, body, background)
+
         for k in list(headers):
             if k.lower() in AUTH_HEADERS:
                 del headers[k]
         if provider in KEY_LABELS and not key:
+            message = f"G2 Switcher: no {KEY_LABELS[provider]} - enter one in the G2 Switcher window"
+            if call:
+                call.fail(message)
             return self._send_json(401, {"type": "error", "error": {"type": "authentication_error",
-                "message": f"G2 Switcher: no {KEY_LABELS[provider]} - enter one in the G2 Switcher window"}})
+                                                                     "message": message}})
 
         if is_claude and isinstance(body, dict) and "/messages" in path:
             _strip_unsigned_thinking(body)
@@ -252,18 +264,30 @@ class RelayHandler(http.server.BaseHTTPRequestHandler):
                 est = int(len(json.dumps(body)) / 3.7) + 4096
                 if est > ctx:
                     self.state.log(f"ollama     ~{est} tokens > {ctx} context - asked Claude Code to compact")
+                    if call:
+                        call.fail(f"conversation (~{est} tokens) is bigger than the model's {ctx} context - "
+                                  "Claude Code will compact it and retry")
                     return self._send_json(400, _too_long(est, ctx))
 
         sent_model = body.get("model") if isinstance(body, dict) else None
         t0 = time.time()
-        status = self._forward(provider, path, headers, body, raw)
+        status = self._forward(provider, path, headers, body, raw, call)
         if status == "retry-no-thinking":
             _strip_unsigned_thinking(body, strip_all=True)
-            status = self._forward(provider, path, headers, body, raw, allow_retry=False)
+            status = self._forward(provider, path, headers, body, raw, call, allow_retry=False)
         if "count_tokens" not in path:
-            self.state.log(f"{provider:<10} {sent_model or '-'}  {status}  {time.time() - t0:.1f}s")
+            self.state.log(f"{provider:<10} {sent_model or '-'}  {status[:200]}  {time.time() - t0:.1f}s")
 
-    def _forward(self, provider, path, headers, body, raw, allow_retry=True):
+    def _forward(self, provider, path, headers, body, raw, call=None, allow_retry=True):
+        status = self._forward_inner(provider, path, headers, body, raw, call, allow_retry)
+        if call and status != "retry-no-thinking":
+            if status.isdigit():
+                call.end()
+            else:
+                call.fail(status if not status[:3].isdigit() else activity.error_message(status[4:].encode()))
+        return status
+
+    def _forward_inner(self, provider, path, headers, body, raw, call, allow_retry):
         base = urllib.parse.urlsplit(PROVIDERS[provider])
         data = json.dumps(body).encode() if body is not None else raw
         headers = dict(headers, **{"Content-Length": str(len(data))})
@@ -301,8 +325,10 @@ class RelayHandler(http.server.BaseHTTPRequestHandler):
                     err = json.dumps({"type": "error", "error": {"type": "not_found_error", "message":
                         f"G2 Switcher: Ollama model '{(body or {}).get('model')}' not found"}}).encode()
                 self._send_raw(resp.status, resp.getheaders(), err)
-                return f"{resp.status} {err[:200].decode('utf-8', 'replace')}"
+                return f"{resp.status} {err[:2000].decode('utf-8', 'replace')}"
 
+            if call:
+                call.headers(resp.getheader("Content-Type"))
             self.send_response(resp.status)
             for k, v in resp.getheaders():
                 if k.lower() not in HOP_HEADERS:
@@ -315,6 +341,11 @@ class RelayHandler(http.server.BaseHTTPRequestHandler):
                     break
                 self.wfile.write(b"%x\r\n%s\r\n" % (len(chunk), chunk))
                 self.wfile.flush()
+                if call:
+                    try:
+                        call.feed(chunk)
+                    except Exception:  # the activity feed must never break the actual stream
+                        call = None
             self.wfile.write(b"0\r\n\r\n")
             self.wfile.flush()
             return str(resp.status)

@@ -28,10 +28,13 @@ RELAY_PORT = int(os.environ.get("G2_SWITCHER_PORT", 3457))
 NO_WINDOW = 0x08000000  # CREATE_NO_WINDOW
 
 PROVIDERS = ("claude", "claude_sub", "openrouter", "ollama")
+MIN_CONTEXT = 64_000  # Claude Code's system prompt + tools are ~40k tokens before you say anything
 
 DEFAULTS = {
     "provider": "claude",
     "autostart": False,  # start Even Terminal when G2 Switcher opens
+    "model_filter": "free",  # OpenRouter list: all / free / paid / starred
+    "favorites": [],         # starred OpenRouter model ids
     "models": {
         "openrouter": {"main": "nvidia/nemotron-3-ultra-550b-a55b:free",
                        "fast": "nvidia/nemotron-3.5-lightning:free"},
@@ -48,6 +51,9 @@ def load_settings():
         if saved.get("provider") in PROVIDERS:
             s["provider"] = saved["provider"]
         s["autostart"] = bool(saved.get("autostart", False))
+        if saved.get("model_filter") in ("all", "free", "paid", "starred"):
+            s["model_filter"] = saved["model_filter"]
+        s["favorites"] = [f for f in saved.get("favorites", []) if isinstance(f, str)]
         for p, m in saved.get("models", {}).items():
             s["models"].setdefault(p, {}).update(m)
     except (OSError, ValueError):
@@ -128,12 +134,36 @@ def test_key(provider, key):
         return False, f"couldn't connect: {e}"
 
 
+def _per_million(price):
+    try:
+        return float(price) * 1_000_000
+    except (TypeError, ValueError):
+        return -1
+
+
+def _money(x):
+    return f"${x:.2f}" if x < 10 else f"${x:.0f}"
+
+
 def list_models(provider):
-    if provider == "openrouter":
-        data = fetch_json("https://openrouter.ai/api/v1/models", timeout=20)["data"]
-        return sorted(m["id"] for m in data
-                      if m["id"].endswith(":free") and "tools" in (m.get("supported_parameters") or []))
-    return sorted(m["name"] for m in fetch_json("http://127.0.0.1:11434/api/tags")["models"])
+    """Models usable from Claude Code, as dicts: id, free, price (label), cost (sort key), ctx."""
+    if provider == "ollama":
+        return [{"id": m["name"], "free": True, "price": "local", "cost": 0, "ctx": None}
+                for m in sorted(fetch_json("http://127.0.0.1:11434/api/tags")["models"], key=lambda m: m["name"])]
+    models = []
+    for m in fetch_json("https://openrouter.ai/api/v1/models", timeout=20)["data"]:
+        if "tools" not in (m.get("supported_parameters") or []):
+            continue  # Claude Code can't work without tool calling
+        if m["id"].endswith(":batch") or (m.get("context_length") or 0) < MIN_CONTEXT:
+            continue  # batch-only, or too small for Claude Code's prompt
+        pricing = m.get("pricing") or {}
+        p_in, p_out = _per_million(pricing.get("prompt")), _per_million(pricing.get("completion"))
+        if p_in < 0 or p_out < 0:
+            continue  # routers with variable pricing
+        free = m["id"].endswith(":free") or (p_in == 0 and p_out == 0)
+        models.append({"id": m["id"], "free": free, "cost": p_in + p_out, "ctx": m.get("context_length"),
+                       "price": "free" if free else f"{_money(p_in)} / {_money(p_out)}"})
+    return sorted(models, key=lambda m: m["id"])
 
 
 # ---------- Even Terminal process ----------
