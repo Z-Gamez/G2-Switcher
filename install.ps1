@@ -6,9 +6,18 @@ if (-not (Test-Path $src)) { throw "Build first: run build.bat" }
 
 $dir = Join-Path $env:LOCALAPPDATA "Programs\G2 Switcher"
 New-Item -ItemType Directory -Force $dir | Out-Null
-Get-Process "G2 Switcher" -ErrorAction SilentlyContinue | Stop-Process -Force
+$running = Get-Process "G2 Switcher" -ErrorAction SilentlyContinue
+if ($running) {
+    Write-Host "Closing the running G2 Switcher (this also stops its Even Terminal)..."
+    $running | Stop-Process -Force
+    $running | Wait-Process -Timeout 15 -ErrorAction SilentlyContinue
+}
 $exe = Join-Path $dir "G2 Switcher.exe"
-Copy-Item $src $exe -Force
+# Windows can hold the file for a moment after the process exits.
+for ($i = 0; ; $i++) {
+    try { Copy-Item $src $exe -Force; break }
+    catch { if ($i -ge 20) { throw }; Start-Sleep -Milliseconds 500 }
+}
 
 $shell = New-Object -ComObject WScript.Shell
 $links = @(
