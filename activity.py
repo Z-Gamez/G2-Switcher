@@ -13,6 +13,8 @@ Events are plain dicts handed to an `emit` callback:
   tool      a tool call finished      {name, detail}
   done      reply finished            {secs, stop, out_tokens}
   error     the call failed           {message}
+  compact   relay asked Claude Code to compact first   {used, limit}
+  trimmed   relay shrank an oversized compaction request {items, before, after}
 """
 
 import itertools
@@ -20,6 +22,8 @@ import json
 import time
 
 _ids = itertools.count(1)
+
+COMPACT_MARKER = "create a detailed summary of the conversation so far"  # Claude Code's compaction prompt
 
 # Most informative argument to show for common Claude Code tools.
 _TOOL_ARGS = ("file_path", "command", "pattern", "url", "query", "path", "description", "prompt", "skill")
@@ -43,6 +47,8 @@ def describe_input(body):
         return ""
     last = msgs[-1]
     blocks = _blocks(last.get("content"))
+    if any(COMPACT_MARKER in (b.get("text") or "") for b in blocks):
+        return "compacting: summarizing the conversation so far"
     results = [b for b in blocks if b.get("type") == "tool_result"]
     if results:
         failed = sum(1 for b in results if b.get("is_error"))
@@ -167,6 +173,11 @@ class Call:
                 pass
         self.ended = True
         self.emit("done", secs=time.time() - self.t0, stop=self.stop, out_tokens=self.out_tokens)
+
+    def compacting(self, used, limit):
+        if not self.ended:
+            self.ended = True
+            self.emit("compact", used=used, limit=limit)
 
     def fail(self, message):
         if not self.ended:

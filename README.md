@@ -82,6 +82,19 @@ above it is live: *waiting for the provider*, *thinking*, *writing*, *Claude Cod
 tool* — with a timer, and a hint if a provider has been silent for a while. The **system** tab
 has G2 Switcher's and Even Terminal's own log.
 
+### Auto-compact
+
+Claude Code thinks it's always talking to Claude, with a context window of up to 1M tokens,
+so on its own it never compacts for a 64k local model — long runs would just stop with
+"prompt is too long". With **auto-compact** on (the default), the relay asks Claude Code to
+compact shortly before the real limit: ~12k tokens before Ollama's 64k, or near the limit of
+the OpenRouter model you picked. Claude Code summarizes the conversation and carries on, even
+in the middle of a multi-step task. If one huge tool output overshoots the limit, the relay trims
+old tool outputs in the summary request so it still fits.
+
+The Claude providers are never touched — they keep Claude Code's normal behavior. Switching
+provider switches this instantly; nothing restarts.
+
 Closing the window keeps G2 Switcher in the system tray — right-click the tray icon to
 switch providers, start/stop Even Terminal, or quit. Launching it again just brings the
 window back.

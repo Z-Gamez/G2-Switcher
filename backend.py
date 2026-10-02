@@ -35,6 +35,7 @@ DEFAULTS = {
     "autostart": False,  # start Even Terminal when G2 Switcher opens
     "model_filter": "free",  # OpenRouter list: all / free / paid / starred
     "favorites": [],         # starred OpenRouter model ids
+    "auto_compact": True,    # compact before Ollama/OpenRouter context limits (Claude is never affected)
     "models": {
         "openrouter": {"main": "nvidia/nemotron-3-ultra-550b-a55b:free",
                        "fast": "nvidia/nemotron-3.5-lightning:free"},
@@ -54,6 +55,7 @@ def load_settings():
         if saved.get("model_filter") in ("all", "free", "paid", "starred"):
             s["model_filter"] = saved["model_filter"]
         s["favorites"] = [f for f in saved.get("favorites", []) if isinstance(f, str)]
+        s["auto_compact"] = bool(saved.get("auto_compact", True))
         for p, m in saved.get("models", {}).items():
             s["models"].setdefault(p, {}).update(m)
     except (OSError, ValueError):

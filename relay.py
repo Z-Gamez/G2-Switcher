@@ -39,6 +39,82 @@ PLACEHOLDER_TOKEN = "g2-switcher-relay"
 AUTH_HEADERS = ("authorization", "x-api-key")
 OAUTH_BETA = "oauth-2025-04-20"
 SHOW_PATH = "/g2-switcher/show"
+
+# Claude Code's own compaction request (it summarises the conversation so far).
+COMPACT_MARKER = "create a detailed summary of the conversation so far"
+
+
+def is_compaction(body):
+    msgs = body.get("messages") or []
+    return bool(msgs) and COMPACT_MARKER in json.dumps(msgs[-1].get("content"))
+
+
+def compact_trigger(ctx):
+    """Token count at which to ask Claude Code to compact: leave room for the
+    compaction request itself (instructions + summary output) to still fit."""
+    return int(ctx - max(12000, ctx * 0.15))
+
+
+def estimate(body):
+    return int(len(json.dumps(body)) / 3.7)  # measured ~4.1 chars/token; 3.7 errs on the safe side
+
+
+def _cut(text, keep_head=800, keep_tail=400):
+    if len(text) <= keep_head + keep_tail + 200:
+        return text
+    return (f"{text[:keep_head]}\n[... {len(text) - keep_head - keep_tail} characters cut by G2 Switcher "
+            f"so the summary fits the model's context ...]\n{text[-keep_tail:]}")
+
+
+def fit_compaction(body, budget):
+    """Shrink Claude Code's compaction request until it fits `budget` tokens, cutting
+    the bulkiest old content first: tool outputs, then long text, then whole messages.
+    Returns how many items were cut (0 if it already fit)."""
+    msgs = body.get("messages") or []
+    if estimate(body) <= budget or len(msgs) < 2:
+        return 0
+    cut = 0
+    for kinds in (("tool_result",), ("text",)):
+        for msg in msgs:
+            if not isinstance(msg.get("content"), list):
+                if ("text" in kinds and isinstance(msg.get("content"), str) and len(msg["content"]) > 1400
+                        and COMPACT_MARKER not in msg["content"]):
+                    msg["content"], cut = _cut(msg["content"]), cut + 1
+                continue
+            for block in msg["content"]:
+                # Never cut the summarisation instructions themselves (the relay may have merged
+                # them into the same message as a big tool output).
+                if block.get("type") not in kinds or COMPACT_MARKER in block.get("text", ""):
+                    continue
+                if block["type"] == "tool_result":
+                    content = block.get("content")
+                    text = content if isinstance(content, str) else json.dumps(content)
+                    if len(text) > 1400:
+                        block["content"], cut = _cut(text), cut + 1
+                elif len(block.get("text", "")) > 1400:
+                    block["text"], cut = _cut(block["text"]), cut + 1
+                if estimate(body) <= budget:
+                    return cut
+    # Still too big: drop the oldest messages, keeping the first user turn for context.
+    while estimate(body) > budget and len(msgs) > 3:
+        del msgs[1]
+        cut += 1
+    # Dropping messages can orphan tool calls/results; turn those into plain text.
+    ids_used = {b.get("id") for m in msgs if isinstance(m.get("content"), list) for b in m["content"]
+                if b.get("type") == "tool_use"}
+    ids_answered = {b.get("tool_use_id") for m in msgs if isinstance(m.get("content"), list)
+                    for b in m["content"] if b.get("type") == "tool_result"}
+    for m in msgs:
+        if isinstance(m.get("content"), list):
+            m["content"] = [
+                {"type": "text", "text": f"[tool result] {_cut(json.dumps(b.get('content')))}"}
+                if b.get("type") == "tool_result" and b.get("tool_use_id") not in ids_used else
+                {"type": "text", "text": f"[called {b.get('name')}]"}
+                if b.get("type") == "tool_use" and b.get("id") not in ids_answered else b
+                for b in m["content"]]
+    if msgs and msgs[0].get("role") != "user":
+        msgs.insert(0, {"role": "user", "content": "[earlier conversation omitted to fit the context window]"})
+    return cut
 CLAUDE_PROVIDERS = ("claude", "claude_sub")
 KEY_LABELS = {"claude": "Anthropic API key", "claude_sub": "Claude subscription token",
               "openrouter": "OpenRouter API key"}
@@ -58,6 +134,11 @@ class State:
         self.log = lambda msg: None
         self.on_show = lambda: None  # a second G2 Switcher launch asks this one to show itself
         self.on_ai = lambda event: None  # activity.Call events: what the model is doing
+        # Claude Code assumes Claude's huge context window, so for providers with a smaller
+        # one the relay asks it to compact before the real limit (see _maybe_compact).
+        self.auto_compact = True
+        self.contexts = {}  # OpenRouter model id -> context length
+        self.just_compacted = False  # let the first request after a compaction through (no loops)
 
     def snapshot(self):
         with self.lock:
@@ -258,6 +339,7 @@ class RelayHandler(http.server.BaseHTTPRequestHandler):
                 return self._send_json(200, _estimate_tokens(body or {}))
             if isinstance(body, dict) and body.get("model"):
                 body["model"], ctx = _ollama_big_ctx(body["model"], self.state.log)
+                self._fit_if_compaction(provider, body, ctx, call)
                 # Ollama's own engine silently truncates oversized prompts (cutting off
                 # Claude Code's instructions), so check size here. Measured ~4.1 JSON chars
                 # per token; 3.7 leaves a margin, plus room for the reply.
@@ -265,9 +347,16 @@ class RelayHandler(http.server.BaseHTTPRequestHandler):
                 if est > ctx:
                     self.state.log(f"ollama     ~{est} tokens > {ctx} context - asked Claude Code to compact")
                     if call:
-                        call.fail(f"conversation (~{est} tokens) is bigger than the model's {ctx} context - "
-                                  "Claude Code will compact it and retry")
+                        call.compacting(est, ctx)
                     return self._send_json(400, _too_long(est, ctx))
+                if self._maybe_compact(provider, body, ctx, call):
+                    return
+        if provider == "openrouter" and isinstance(body, dict):
+            ctx = self.state.contexts.get(body.get("model"))
+            if ctx:
+                self._fit_if_compaction(provider, body, ctx, call)
+                if self._maybe_compact(provider, body, ctx, call):
+                    return
 
         sent_model = body.get("model") if isinstance(body, dict) else None
         t0 = time.time()
@@ -277,6 +366,45 @@ class RelayHandler(http.server.BaseHTTPRequestHandler):
             status = self._forward(provider, path, headers, body, raw, call, allow_retry=False)
         if "count_tokens" not in path:
             self.state.log(f"{provider:<10} {sent_model or '-'}  {status[:200]}  {time.time() - t0:.1f}s")
+
+    def _maybe_compact(self, provider, body, ctx, call):
+        """Ask Claude Code to compact before the provider's real context limit.
+
+        Claude Code thinks it's talking to Claude (up to 1M tokens), so on its own it
+        would never compact for a 64k local model. Answering with its "prompt is too
+        long" error makes it summarise the conversation and carry on - even mid-task.
+        Returns True if the request was answered here."""
+        if not (self.state.auto_compact and body.get("tools") and "messages" in body) or is_compaction(body):
+            return False  # side requests (titles etc.) have no tools and are small
+        est = estimate(body)
+        if est <= compact_trigger(ctx):
+            self.state.just_compacted = False
+            return False
+        if self.state.just_compacted:
+            # Right after a compaction: let it through rather than loop (the hard limit still applies).
+            self.state.just_compacted = False
+            return False
+        trigger = compact_trigger(ctx)
+        self.state.log(f"{provider:<10} ~{est} of {ctx} tokens used - asked Claude Code to compact")
+        if call:
+            call.compacting(est, ctx)
+        self._send_json(400, _too_long(est, trigger))
+        return True
+
+    def _fit_if_compaction(self, provider, body, ctx, call):
+        """A compaction request can itself be too big for a small context (one huge tool
+        output pushed the conversation past the limit). Trim it so the summary can happen."""
+        if not (self.state.auto_compact and is_compaction(body)):
+            return
+        self.state.just_compacted = True
+        budget = ctx - 4096 - 6000  # room for the summary Claude Code asks for
+        before = estimate(body)
+        cut = fit_compaction(body, budget)
+        if cut:
+            self.state.log(f"{provider:<10} compaction request ~{before} -> ~{estimate(body)} tokens "
+                           f"({cut} old outputs trimmed to fit {ctx})")
+            if call:
+                call.emit("trimmed", items=cut, before=before, after=estimate(body))
 
     def _forward(self, provider, path, headers, body, raw, call=None, allow_retry=True):
         status = self._forward_inner(provider, path, headers, body, raw, call, allow_retry)

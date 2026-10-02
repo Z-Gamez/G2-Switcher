@@ -24,7 +24,7 @@ import backend
 import relay
 import theme as T
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 PROVIDERS = {
     #  key          name          variant          one-line description
@@ -105,6 +105,7 @@ class App:
         state.log = lambda msg: self.events.put(("relay", msg))
         state.on_show = lambda: self.events.put(("call", self.show))
         state.on_ai = lambda ev: self.events.put(("ai", ev))
+        state.auto_compact = self.settings["auto_compact"]
 
         self._fonts()
         self._style()
@@ -330,6 +331,8 @@ class App:
             r = self._openrouter_picker(box, r)
         elif p == "ollama":
             r = self._ollama_picker(box, r)
+        if p in self.model_lists:
+            r = self._compact_row(box, r, p)
 
         self.hint = tk.Label(box, text=HINTS[p], bg=T.PANEL, fg=T.DIM, font=self.f_small, anchor="w",
                              justify="left", wraplength=560)
@@ -416,6 +419,31 @@ class App:
         self.model_combo = cb
         self._fill_combo()
         return r + 1
+
+    def _compact_row(self, box, r, p):
+        limit = (f"{relay.OLLAMA_MIN_CTX // 1024}k" if p == "ollama" else "the model's")
+        row = tk.Frame(box, bg=T.PANEL)
+        row.grid(row=r, column=1, columnspan=2, sticky="w", pady=(8, 0))
+        btn = Button(row, "", self.toggle_auto_compact, self.f_small, fg=T.DIM, brackets=False)
+        btn.pack(side="left")
+        tk.Label(row, text=f"compact before {limit} context limit, so long runs keep going",
+                 bg=T.PANEL, fg=T.DIM, font=self.f_small).pack(side="left", padx=(6, 0))
+        self.compact_btn = btn
+        self._paint_compact()
+        return r + 1
+
+    def toggle_auto_compact(self):
+        self.settings["auto_compact"] = not self.settings["auto_compact"]
+        self.state.auto_compact = self.settings["auto_compact"]
+        backend.save_settings(self.settings)
+        self._paint_compact()
+        self.write(f"auto-compact {'on' if self.settings['auto_compact'] else 'off'} for Ollama / OpenRouter",
+                   "ok", log="system")
+
+    def _paint_compact(self):
+        on = self.settings["auto_compact"]
+        self.compact_btn.fg = T.GREEN if on else T.DIM
+        self.compact_btn.set_text(f"[{'x' if on else ' '}] auto-compact")
 
     def _fill_combo(self):
         if not self.model_combo:
@@ -628,6 +656,20 @@ class App:
             return
 
         where = label(call.get("provider", "claude")) if call else ""
+        if kind == "request" and ev["input"].startswith("compacting"):
+            call["compaction"] = True
+            self.write("summarizing the conversation so far to free up context…", "warn", log="ai", prefix="⇣ ")
+            self._ai_phase("compacting", ev["rid"], where)
+            return
+        if call.get("compaction") and kind != "error":
+            # The summary itself is long and not interesting on the glasses; just report completion.
+            if kind == "trimmed":
+                self.write(f"trimmed {ev['items']} old tool outputs so the summary fits "
+                           f"(~{ev['before'] / 1000:.0f}k → ~{ev['after'] / 1000:.0f}k tokens)", "dim", log="ai", prefix="✂ ")
+            if kind == "done":
+                self.write(f"conversation compacted in {ev['secs']:.0f}s - continuing", "ok", log="ai", prefix="✓ ")
+                self.calls.pop(ev["rid"], None)
+            return
         if kind == "request":
             if ev["input"].startswith("you: "):
                 self.write(ev["input"][5:], "you", log="ai", prefix="▸ ")
@@ -670,6 +712,10 @@ class App:
         elif kind == "error":
             self.write(ev["message"], "err", log="ai", prefix="✗ ")
             self._ai_phase("error", ev["rid"], where, ev["message"])
+        elif kind == "compact":
+            self.write(f"context ~{ev['used'] / 1000:.0f}k of {ev['limit'] / 1000:.0f}k - asking Claude Code to "
+                       "compact so the run can keep going", "warn", log="ai", prefix="⇣ ")
+            self._ai_phase("compacting", ev["rid"], where)
         if kind in ("done", "error"):
             self.calls.pop(ev["rid"], None)
 
@@ -704,6 +750,8 @@ class App:
             text = f"{s}  writing a reply · {a['detail']}"
         elif phase == "tool":
             text, color = f"{s}  Claude Code is running {a['detail']} · {secs}s", T.CYAN
+        elif phase == "compacting":
+            text, color = f"{s}  compacting the conversation to free up context · {secs}s", T.AMBER
         else:
             text, color = f"✗  {a['detail'][:150]}", T.RED
         self.status.configure(text=text, fg=color)
@@ -786,6 +834,7 @@ class App:
                     self._paint_cards()
                     self._fill_combo()
                 else:
+                    self.state.contexts = {m["id"]: m["ctx"] for m in models if m.get("ctx")}
                     self._fill_model_list()
             elif kind == "models_failed":
                 p, err = payload
