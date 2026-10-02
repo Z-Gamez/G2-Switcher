@@ -1,0 +1,80 @@
+# Builds G2-Switcher.exe on GitHub's Windows runners for every version tag (v1.2.3),
+# code-signs it with SignPath when that's set up, and attaches it to the GitHub release.
+#
+# Signing is optional: without the SignPath secrets below the exe is built and released
+# unsigned, exactly like a local build.bat. To turn signing on, apply for SignPath's free
+# open-source program (https://signpath.org), then add to this repo's settings:
+#   Secrets:   SIGNPATH_API_TOKEN
+#   Variables: SIGNPATH_ORGANIZATION_ID, SIGNPATH_PROJECT_SLUG, SIGNPATH_SIGNING_POLICY_SLUG
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to (re)build and attach, e.g. v1.3.0"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+      SIGN: ${{ secrets.SIGNPATH_API_TOKEN != '' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build exe
+        shell: cmd
+        run: |
+          python -m pip install -r requirements.txt pyinstaller
+          call build.bat
+          mkdir out
+          copy "dist\G2 Switcher.exe" "out\G2-Switcher.exe"
+
+      - name: Upload unsigned exe
+        id: unsigned
+        uses: actions/upload-artifact@v4
+        with:
+          name: G2-Switcher-unsigned
+          path: out/G2-Switcher.exe
+
+      - name: Code-sign with SignPath
+        if: env.SIGN == 'true'
+        uses: signpath/github-action-submit-signing-request@v2
+        with:
+          connector-url: https://githubactions.connectors.signpath.io
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+          github-artifact-id: ${{ steps.unsigned.outputs.artifact-id }}
+          wait-for-completion: true
+          output-artifact-directory: signed
+
+      - name: Attach to the GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          exe=out/G2-Switcher.exe
+          [ -f signed/G2-Switcher.exe ] && exe=signed/G2-Switcher.exe
+          sha=$(sha256sum "$exe" | cut -d' ' -f1)
+          echo "Releasing $exe  sha256=$sha"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$exe" --clobber
+          else
+            gh release create "$TAG" "$exe" --title "G2 Switcher $TAG" --generate-notes
+          fi
+          echo "SHA-256: \`$sha\`" >> "$GITHUB_STEP_SUMMARY"

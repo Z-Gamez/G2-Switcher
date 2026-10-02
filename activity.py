@@ -15,6 +15,7 @@ Events are plain dicts handed to an `emit` callback:
   error     the call failed           {message}
   compact   relay asked Claude Code to compact first   {used, limit}
   trimmed   relay shrank an oversized compaction request {items, before, after}
+  context   how full the context window is              {used, limit (None = Claude), exact}
 """
 
 import itertools
@@ -112,7 +113,13 @@ class Call:
 
     def _event(self, ev):
         t = ev.get("type")
-        if t == "content_block_start":
+        if t == "message_start":
+            usage = (ev.get("message") or {}).get("usage") or {}
+            used = sum(usage.get(k) or 0 for k in ("input_tokens", "cache_read_input_tokens",
+                                                   "cache_creation_input_tokens"))
+            if used > 0:
+                self.emit("context", used=used, limit=getattr(self, "limit", None), exact=True)
+        elif t == "content_block_start":
             block = dict(ev.get("content_block") or {})
             block.update(_text="", _json="", _t=time.time())
             self.blocks[ev.get("index")] = block
@@ -173,6 +180,11 @@ class Call:
                 pass
         self.ended = True
         self.emit("done", secs=time.time() - self.t0, stop=self.stop, out_tokens=self.out_tokens)
+
+    def context(self, used, limit):
+        """How full the context is for this call (estimate; refined from the reply's usage)."""
+        self.limit = limit
+        self.emit("context", used=used, limit=limit, exact=False)
 
     def compacting(self, used, limit):
         if not self.ended:

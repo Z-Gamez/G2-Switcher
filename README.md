@@ -95,9 +95,27 @@ old tool outputs in the summary request so it still fits.
 The Claude providers are never touched — they keep Claude Code's normal behavior. Switching
 provider switches this instantly; nothing restarts.
 
+The **context meter** on the right of the activity bar shows how full the window is
+(e.g. `▰▰▰▰▰▰▱▱▱▱ 41k / 64k`), turning amber as it nears the compaction point.
+
+### Local context size
+
+Pick Ollama's context window from presets — **64k / 96k / 128k / 192k / 256k** (sizes above
+what the selected model supports are greyed out). Bigger windows mean longer runs between
+compactions but use more memory and make the first reply slower. Changing it takes effect on
+the next message (the model reloads). Models with mostly linear attention, like the Qwen 3.6
+MoE coders, need surprisingly little extra memory for big windows.
+
+### Tray, login and updates
+
 Closing the window keeps G2 Switcher in the system tray — right-click the tray icon to
 switch providers, start/stop Even Terminal, or quit. Launching it again just brings the
 window back.
+
+- **start Even Terminal with the app** — no need to press start.
+- **launch at Windows login (in tray)** — starts hidden in the tray when you sign in, so with
+  the option above, Terminal is ready whenever you put the glasses on.
+- When a newer release is out, an **update available** link appears in the header.
 
 ## Where things are stored
 
@@ -127,6 +145,10 @@ except to the provider you select.
 ## Development
 
 `G2_SWITCHER_PORT=3499 python app.py` runs a second copy on another relay port.
+
+Releases are built by GitHub Actions (`.github/workflows/release.yml`) when a `v*` tag is
+pushed. The workflow code-signs the exe through [SignPath](https://signpath.org)'s free
+open-source program once its secrets are configured; until then releases are unsigned.
 
 | File | Purpose |
 |---|---|

@@ -16,6 +16,7 @@ never needs a Claude login; the real keys live here and are entered in the GUI.
 import http.client
 import http.server
 import json
+import re
 import socket
 import ssl
 import threading
@@ -31,8 +32,10 @@ PROVIDERS = {
     "ollama": "http://127.0.0.1:11434",
 }
 
-# Claude Code's system prompt + tools alone is ~25-40k tokens.
-OLLAMA_MIN_CTX = 65536
+# Claude Code's system prompt + tools alone is ~25-40k tokens, so local models need a
+# bigger window than Ollama's default. The user picks one of these in the GUI.
+OLLAMA_CTX_PRESETS = (65536, 98304, 131072, 196608, 262144)
+OLLAMA_DEFAULT_CTX = 65536
 
 # Given to Claude Code as ANTHROPIC_AUTH_TOKEN; replaced by the relay before forwarding.
 PLACEHOLDER_TOKEN = "g2-switcher-relay"
@@ -139,6 +142,7 @@ class State:
         self.auto_compact = True
         self.contexts = {}  # OpenRouter model id -> context length
         self.just_compacted = False  # let the first request after a compaction through (no loops)
+        self.ollama_ctx = OLLAMA_DEFAULT_CTX
 
     def snapshot(self):
         with self.lock:
@@ -213,31 +217,39 @@ def _ollama_call(path, payload, timeout=600):
         conn.close()
 
 
-def _ollama_big_ctx(model, log):
-    """Return a variant of `model` whose context window fits Claude Code,
-    creating it (shares weights, no extra disk) the first time it's needed."""
+VARIANT_SUFFIX = re.compile(r"[-:]g2-\d+k$")
+
+
+def base_model(model):
+    """`qwen3:4b-g2-64k` -> `qwen3:4b` (our context variants are an implementation detail)."""
+    return VARIANT_SUFFIX.sub("", model)
+
+
+def _ollama_ctx_variant(model, want, log):
+    """Return (name, ctx) for a variant of `model` with a `want`-token context window,
+    creating it the first time (it shares the model's weights, so no extra disk)."""
+    model = base_model(model)
     with _ctx_lock:
-        if model in _ctx_variants:
-            return _ctx_variants[model]
+        if (model, want) in _ctx_variants:
+            return _ctx_variants[(model, want)]
         try:
             info = _ollama_call("/api/show", {"model": model}, timeout=30)
             params = info.get("parameters") or ""
             found = [int(line.split()[1]) for line in params.splitlines()
                      if line.split()[:1] == ["num_ctx"] and len(line.split()) > 1]
-            ctx = found[0] if found else 0  # unset -> Ollama's small default
-            if ctx >= OLLAMA_MIN_CTX:
-                result = (model, ctx)
+            if found and found[0] == want:
+                result = (model, want)
             else:
-                k = OLLAMA_MIN_CTX // 1024
+                k = want // 1024
                 name = f"{model}-g2-{k}k" if ":" in model else f"{model}:g2-{k}k"
                 _ollama_call("/api/create", {"model": name, "from": model, "stream": False,
-                                             "parameters": {"num_ctx": OLLAMA_MIN_CTX}})
-                log(f"ollama     {model} has a {ctx or 'default'} context; using {name} ({k}k) instead")
-                result = (name, OLLAMA_MIN_CTX)
+                                             "parameters": {"num_ctx": want}})
+                log(f"ollama     using {name} ({k}k context)")
+                result = (name, want)
         except (OSError, ValueError) as e:
-            log(f"ollama     couldn't check context of {model}: {e}")
-            return model, OLLAMA_MIN_CTX  # don't cache; retry next request
-        _ctx_variants[model] = result
+            log(f"ollama     couldn't set up a {want // 1024}k context for {model}: {e}")
+            return model, want  # don't cache; retry next request
+        _ctx_variants[(model, want)] = result
         return result
 
 
@@ -338,7 +350,7 @@ class RelayHandler(http.server.BaseHTTPRequestHandler):
             if path.split("?")[0].endswith("/count_tokens"):
                 return self._send_json(200, _estimate_tokens(body or {}))
             if isinstance(body, dict) and body.get("model"):
-                body["model"], ctx = _ollama_big_ctx(body["model"], self.state.log)
+                body["model"], ctx = _ollama_ctx_variant(body["model"], self.state.ollama_ctx, self.state.log)
                 self._fit_if_compaction(provider, body, ctx, call)
                 # Ollama's own engine silently truncates oversized prompts (cutting off
                 # Claude Code's instructions), so check size here. Measured ~4.1 JSON chars
@@ -351,12 +363,18 @@ class RelayHandler(http.server.BaseHTTPRequestHandler):
                     return self._send_json(400, _too_long(est, ctx))
                 if self._maybe_compact(provider, body, ctx, call):
                     return
+                if call:
+                    call.context(estimate(body), ctx)
         if provider == "openrouter" and isinstance(body, dict):
             ctx = self.state.contexts.get(body.get("model"))
             if ctx:
                 self._fit_if_compaction(provider, body, ctx, call)
                 if self._maybe_compact(provider, body, ctx, call):
                     return
+            if call:
+                call.context(estimate(body), ctx)
+        if is_claude and call:
+            call.context(estimate(body), None)  # Claude Code manages Claude's own window
 
         sent_model = body.get("model") if isinstance(body, dict) else None
         t0 = time.time()
@@ -442,9 +460,9 @@ class RelayHandler(http.server.BaseHTTPRequestHandler):
                     # Reword into Anthropic's format so Claude Code auto-compacts and retries.
                     try:
                         e = json.loads(err).get("error", {})
-                        n, limit = e.get("n_prompt_tokens", 0), e.get("n_ctx", OLLAMA_MIN_CTX)
+                        n, limit = e.get("n_prompt_tokens", 0), e.get("n_ctx", self.state.ollama_ctx)
                     except ValueError:
-                        n, limit = 0, OLLAMA_MIN_CTX
+                        n, limit = 0, self.state.ollama_ctx
                     err = json.dumps(_too_long(n, limit)).encode()
                     self._send_raw(400, [("Content-Type", "application/json")], err)
                     return f"400 context full ({n} > {limit}) - asked Claude Code to compact"

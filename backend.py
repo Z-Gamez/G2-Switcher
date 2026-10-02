@@ -6,10 +6,12 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import threading
 import time
 import urllib.error
 import urllib.request
+import winreg
 from pathlib import Path
 
 import relay
@@ -36,6 +38,7 @@ DEFAULTS = {
     "model_filter": "free",  # OpenRouter list: all / free / paid / starred
     "favorites": [],         # starred OpenRouter model ids
     "auto_compact": True,    # compact before Ollama/OpenRouter context limits (Claude is never affected)
+    "ollama_ctx": relay.OLLAMA_DEFAULT_CTX,  # local context window, one of relay.OLLAMA_CTX_PRESETS
     "models": {
         "openrouter": {"main": "nvidia/nemotron-3-ultra-550b-a55b:free",
                        "fast": "nvidia/nemotron-3.5-lightning:free"},
@@ -56,6 +59,8 @@ def load_settings():
             s["model_filter"] = saved["model_filter"]
         s["favorites"] = [f for f in saved.get("favorites", []) if isinstance(f, str)]
         s["auto_compact"] = bool(saved.get("auto_compact", True))
+        if saved.get("ollama_ctx") in relay.OLLAMA_CTX_PRESETS:
+            s["ollama_ctx"] = saved["ollama_ctx"]
         for p, m in saved.get("models", {}).items():
             s["models"].setdefault(p, {}).update(m)
     except (OSError, ValueError):
@@ -150,8 +155,11 @@ def _money(x):
 def list_models(provider):
     """Models usable from Claude Code, as dicts: id, free, price (label), cost (sort key), ctx."""
     if provider == "ollama":
-        return [{"id": m["name"], "free": True, "price": "local", "cost": 0, "ctx": None}
-                for m in sorted(fetch_json("http://127.0.0.1:11434/api/tags")["models"], key=lambda m: m["name"])]
+        # ctx = the model's maximum context; our "-g2-NNk" context variants are hidden.
+        return [{"id": m["name"], "free": True, "price": "local", "cost": 0,
+                 "ctx": (m.get("details") or {}).get("context_length")}
+                for m in sorted(fetch_json("http://127.0.0.1:11434/api/tags")["models"], key=lambda m: m["name"])
+                if relay.base_model(m["name"]) == m["name"]]
     models = []
     for m in fetch_json("https://openrouter.ai/api/v1/models", timeout=20)["data"]:
         if "tools" not in (m.get("supported_parameters") or []):
@@ -166,6 +174,57 @@ def list_models(provider):
         models.append({"id": m["id"], "free": free, "cost": p_in + p_out, "ctx": m.get("context_length"),
                        "price": "free" if free else f"{_money(p_in)} / {_money(p_out)}"})
     return sorted(models, key=lambda m: m["id"])
+
+
+# ---------- launch at login ----------
+RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+RUN_NAME = "G2 Switcher"
+
+
+def login_command():
+    """What Windows runs at login: the exe (or pythonw + app.py from source), hidden in the tray."""
+    if getattr(sys, "frozen", False):
+        return f'"{sys.executable}" --tray'
+    pythonw = Path(sys.executable).with_name("pythonw.exe")
+    return f'"{pythonw if pythonw.exists() else sys.executable}" "{Path(__file__).with_name("app.py")}" --tray'
+
+
+def launch_at_login():
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as k:
+            return bool(winreg.QueryValueEx(k, RUN_NAME)[0])
+    except OSError:
+        return False
+
+
+def set_launch_at_login(enabled):
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as k:
+        if enabled:
+            winreg.SetValueEx(k, RUN_NAME, 0, winreg.REG_SZ, login_command())
+        else:
+            try:
+                winreg.DeleteValue(k, RUN_NAME)
+            except FileNotFoundError:
+                pass
+
+
+# ---------- update check ----------
+REPO = "Z-Gamez/G2-Switcher"
+RELEASES_URL = f"https://github.com/{REPO}/releases/latest"
+
+
+def _version(tag):
+    return tuple(int(n) for n in re.findall(r"\d+", tag)[:3])
+
+
+def newer_release(current):
+    """(tag, url) of the latest GitHub release if it's newer than `current`, else None."""
+    data = fetch_json(f"https://api.github.com/repos/{REPO}/releases/latest", timeout=10,
+                      headers={"Accept": "application/vnd.github+json", "User-Agent": "G2-Switcher"})
+    tag = data.get("tag_name") or ""
+    if tag and _version(tag) > _version(current):
+        return tag, data.get("html_url") or RELEASES_URL
+    return None
 
 
 # ---------- Even Terminal process ----------

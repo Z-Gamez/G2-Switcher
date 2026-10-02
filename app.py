@@ -24,7 +24,7 @@ import backend
 import relay
 import theme as T
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 
 PROVIDERS = {
     #  key          name          variant          one-line description
@@ -56,7 +56,9 @@ def label(provider):
 def short_ctx(n):
     if not n:
         return ""
-    return f"{n / 1_000_000:g}M" if n >= 1_000_000 else f"{n // 1000}k"
+    if n >= 1_000_000:
+        return f"{round(n / 1_000_000, 1):g}M"
+    return f"{n // 1024}k" if n % 1024 == 0 else f"{round(n / 1000)}k"  # 65536 -> 64k, 38211 -> 38k
 
 
 class Button(tk.Label):
@@ -101,11 +103,13 @@ class App:
         self.ai = {"phase": "idle", "since": time.time(), "provider": "", "detail": "", "rid": None}
         self.spin = 0
         self.model_list = self.model_combo = None
+        self.browser_open = False  # OpenRouter model browser expanded?
 
         state.log = lambda msg: self.events.put(("relay", msg))
         state.on_show = lambda: self.events.put(("call", self.show))
         state.on_ai = lambda ev: self.events.put(("ai", ev))
         state.auto_compact = self.settings["auto_compact"]
+        state.ollama_ctx = self.settings["ollama_ctx"]
 
         self._fonts()
         self._style()
@@ -125,6 +129,7 @@ class App:
         self.write("waiting for you to talk to Claude Code on your glasses…", "dim", log="ai")
         if self.settings.get("autostart"):
             root.after(400, self.start_et)
+        root.after(3000, self.check_for_update)
 
     # ---------- look ----------
     def _fonts(self):
@@ -193,6 +198,8 @@ class App:
         self.cursor = tk.Label(head, text="█", bg=T.BG, fg=T.GREEN, font=self.f_title)
         self.cursor.pack(side="left")
         tk.Label(head, text=f"v{VERSION}", bg=T.BG, fg=T.DIM, font=self.f_small).pack(side="right", anchor="s")
+        # Shown only when GitHub has a newer release.
+        self.update_btn = Button(head, "", self.open_update, self.f_small, fg=T.AMBER)
         tk.Label(outer, text="pick which AI answers your G2 glasses' Even Terminal - switch any time",
                  bg=T.BG, fg=T.DIM, font=self.f_small, anchor="w").pack(fill="x")
 
@@ -208,8 +215,12 @@ class App:
         self.et_text.pack(side="left", padx=(8, 0))
         self.et_btn = Button(inner, "start", self.toggle_et, self.f_bold)
         self.et_btn.pack(side="right")
-        self.auto_btn = Button(inner, "", self.toggle_autostart, self.f_small, fg=T.DIM, brackets=False)
-        self.auto_btn.pack(side="right", padx=(0, 10))
+        opts = tk.Frame(card, bg=T.PANEL)
+        opts.pack(fill="x", padx=(30, 12), pady=(0, 8))
+        self.auto_btn = Button(opts, "", self.toggle_autostart, self.f_small, fg=T.DIM, brackets=False)
+        self.auto_btn.pack(side="left")
+        self.login_btn = Button(opts, "", self.toggle_login, self.f_small, fg=T.DIM, brackets=False)
+        self.login_btn.pack(side="left", padx=(18, 0))
         self._paint_autostart()
 
         # providers
@@ -232,8 +243,13 @@ class App:
             self.tab_btns[tab] = b
         logbox = tk.Frame(outer, bg=T.FIELD, highlightthickness=1, highlightbackground=T.LINE)
         logbox.pack(fill="both", expand=True)
-        self.status = tk.Label(logbox, bg=T.SEL, fg=T.DIM, font=self.f_small, anchor="w", padx=10, pady=5)
-        self.status.pack(fill="x")
+        statusbar = tk.Frame(logbox, bg=T.SEL)
+        statusbar.pack(fill="x")
+        # Context meter: how full the model's context window is (from the relay).
+        self.meter = tk.Label(statusbar, bg=T.SEL, fg=T.DIM, font=self.f_small, padx=10, pady=5)
+        self.meter.pack(side="right")
+        self.status = tk.Label(statusbar, bg=T.SEL, fg=T.DIM, font=self.f_small, anchor="w", padx=10, pady=5)
+        self.status.pack(side="left", fill="x", expand=True)
         body = tk.Frame(logbox, bg=T.FIELD)
         body.pack(fill="both", expand=True)
         self.logs = {"ai": self._text(body, 9), "system": self._text(body, 9)}
@@ -369,9 +385,14 @@ class App:
                  anchor="w").grid(row=r, column=0, sticky="w", pady=(4, 0))
         self.current_model = tk.Label(box, bg=T.PANEL, fg=T.GREEN, font=self.f, anchor="w")
         self.current_model.grid(row=r, column=1, sticky="we", pady=(4, 0))
-        Button(box, "refresh", lambda: self.refresh_models("openrouter"), self.f_small).grid(
+        # The browser is collapsed by default so it doesn't squeeze the activity log.
+        Button(box, "done" if self.browser_open else "change", self.toggle_browser, self.f_small).grid(
             row=r, column=2, sticky="e", padx=(8, 0), pady=(4, 0))
         r += 1
+        self.model_list = None
+        if not self.browser_open:
+            self._update_current_model()
+            return r
 
         # filters + search
         tk.Label(box, text="show", bg=T.PANEL, fg=T.DIM, font=self.f_small, width=8,
@@ -383,9 +404,11 @@ class App:
             b = Button(bar, f, lambda f=f: self.set_filter(f), self.f_small, fg=T.DIM)
             b.pack(side="left", padx=(0, 2))
             self.filter_btns[f] = b
+        Button(bar, "↻", lambda: self.refresh_models("openrouter"), self.f_small, fg=T.DIM).pack(side="right")
         search = self._entry(bar, self.search_var, width=18)
-        search.pack(side="right", ipady=2)
+        search.pack(side="right", ipady=2, padx=(0, 4))
         tk.Label(bar, text="search", bg=T.PANEL, fg=T.DIM, font=self.f_small).pack(side="right", padx=(0, 6))
+        search.focus_set()
         r += 1
 
         # list
@@ -418,10 +441,54 @@ class App:
             row=r, column=2, sticky="e", padx=(8, 0), pady=(4, 0))
         self.model_combo = cb
         self._fill_combo()
+        r += 1
+
+        # context window presets (capped at what the model supports)
+        tk.Label(box, text="context", bg=T.PANEL, fg=T.DIM, font=self.f_small, width=8,
+                 anchor="w").grid(row=r, column=0, sticky="w", pady=(8, 0))
+        bar = tk.Frame(box, bg=T.PANEL)
+        bar.grid(row=r, column=1, columnspan=2, sticky="we", pady=(8, 0))
+        self.ctx_btns = {}
+        for ctx in relay.OLLAMA_CTX_PRESETS:
+            b = Button(bar, short_ctx(ctx), lambda c=ctx: self.set_ollama_ctx(c), self.f_small, fg=T.DIM)
+            b.pack(side="left", padx=(0, 2))
+            self.ctx_btns[ctx] = b
+        self.ctx_note = tk.Label(bar, bg=T.PANEL, fg=T.DIM, font=self.f_small)
+        self.ctx_note.pack(side="left", padx=(8, 0))
+        self._paint_ctx()
         return r + 1
 
+    def _model_max_ctx(self):
+        current = relay.base_model(self.settings["models"]["ollama"]["main"])
+        return next((m["ctx"] for m in self.model_lists["ollama"] if m["id"] == current and m["ctx"]), None)
+
+    def _paint_ctx(self):
+        if not getattr(self, "ctx_btns", None) or not self.ctx_note.winfo_exists():
+            return
+        cap = self._model_max_ctx()
+        for ctx, b in self.ctx_btns.items():
+            b.set_enabled(cap is None or ctx <= cap)
+            b.fg = T.GREEN if ctx == self.settings["ollama_ctx"] else T.DIM
+            b._paint()
+        self.ctx_note.configure(text=(f"model max {short_ctx(cap)} · " if cap else "") +
+                                     "bigger = longer runs, more memory")
+
+    def set_ollama_ctx(self, ctx):
+        if ctx == self.settings["ollama_ctx"]:
+            return
+        self.settings["ollama_ctx"] = self.state.ollama_ctx = ctx
+        backend.save_settings(self.settings)
+        if self.state.provider == "ollama":
+            self._build_config()  # the auto-compact line mentions the limit
+        self.write(f"Ollama context → {short_ctx(ctx)} (the model reloads on the next message)", "ok",
+                   log="system")
+
+    def toggle_browser(self):
+        self.browser_open = not self.browser_open
+        self._build_config()
+
     def _compact_row(self, box, r, p):
-        limit = (f"{relay.OLLAMA_MIN_CTX // 1024}k" if p == "ollama" else "the model's")
+        limit = (f"{short_ctx(self.settings['ollama_ctx'])}" if p == "ollama" else "the model's")
         row = tk.Frame(box, bg=T.PANEL)
         row.grid(row=r, column=1, columnspan=2, sticky="w", pady=(8, 0))
         btn = Button(row, "", self.toggle_auto_compact, self.f_small, fg=T.DIM, brackets=False)
@@ -446,10 +513,11 @@ class App:
         self.compact_btn.set_text(f"[{'x' if on else ' '}] auto-compact")
 
     def _fill_combo(self):
-        if not self.model_combo:
+        if not self.model_combo or not self.model_combo.winfo_exists():
             return
         names, current = [m["id"] for m in self.model_lists["ollama"]], self.model_combo.get()
         self.model_combo["values"] = names if current in names or not current else [current] + names
+        self._paint_ctx()
 
     # --- openrouter list ---
     def set_filter(self, f):
@@ -458,7 +526,9 @@ class App:
         self.paint_filters()
 
     def paint_filters(self):
-        for f, b in self.filter_btns.items():
+        for f, b in getattr(self, "filter_btns", {}).items():
+            if not b.winfo_exists():  # browser folded away
+                break
             b.fg = T.GREEN if f == self.settings["model_filter"] else T.DIM
             b._paint()
         self._fill_model_list()
@@ -477,10 +547,10 @@ class App:
         return out
 
     def _fill_model_list(self):
+        self._update_current_model()
         lb = self.model_list
         if not lb or not lb.winfo_exists():
             return
-        self._update_current_model()
         self.visible = self._visible_models()
         favs, current = set(self.settings["favorites"]), self.settings["models"]["openrouter"]["main"]
         cols = max(40, lb.winfo_width() // self.char_w - 2)
@@ -502,7 +572,8 @@ class App:
             lb.itemconfigure(0, fg=T.DIM)
 
     def _update_current_model(self):
-        if getattr(self, "current_model", None) and self.current_model.winfo_exists():
+        if self.state.provider == "openrouter" and getattr(self, "current_model", None) \
+                and self.current_model.winfo_exists():
             current = self.settings["models"]["openrouter"]["main"]
             info = next((m for m in self.model_lists["openrouter"] if m["id"] == current), None)
             self.current_model.configure(text=current + (f"   {info['price']}" if info else ""))
@@ -515,7 +586,8 @@ class App:
         if event and event.x < self.char_w * 3:  # the ☆ column
             return self._toggle_star(idx)
         self.set_model("openrouter", self.visible[idx]["id"])
-        self._fill_model_list()
+        self.browser_open = False  # picked one: fold the browser away again
+        self._build_config()
 
     def _toggle_star(self, idx):
         if idx is None or idx >= len(getattr(self, "visible", [])):
@@ -534,6 +606,8 @@ class App:
             self.state.models = json.loads(json.dumps(self.settings["models"]))
         self.settings["provider"] = p
         backend.save_settings(self.settings)
+        if changed:
+            self.meter.configure(text="")  # the next request fills it in for the new provider
         self._paint_cards()
         self._build_config()
         self._update_route()
@@ -546,11 +620,18 @@ class App:
 
     def set_model(self, p, model):
         model = model.strip()
+        if p == "ollama":
+            model = relay.base_model(model)
         if not model or model == self.settings["models"][p]["main"]:
             return
         self.settings["models"][p]["main"] = model
         if p == "ollama":
             self.settings["models"][p]["fast"] = model  # one local model avoids VRAM swapping
+            cap = self._model_max_ctx()
+            if cap and self.settings["ollama_ctx"] > cap:  # new model supports less: use the biggest it can
+                self.settings["ollama_ctx"] = self.state.ollama_ctx = max(
+                    [c for c in relay.OLLAMA_CTX_PRESETS if c <= cap] or [relay.OLLAMA_DEFAULT_CTX])
+            self._paint_ctx()
         with self.state.lock:
             self.state.models = json.loads(json.dumps(self.settings["models"]))
         backend.save_settings(self.settings)
@@ -607,7 +688,40 @@ class App:
         self._paint_autostart()
 
     def _paint_autostart(self):
-        self.auto_btn.set_text(f"[{'x' if self.settings.get('autostart') else ' '}] auto-start")
+        self.auto_btn.set_text(f"[{'x' if self.settings.get('autostart') else ' '}] start Even Terminal with the app")
+        on = backend.launch_at_login()
+        self.login_btn.set_text(f"[{'x' if on else ' '}] launch at Windows login (in tray)")
+
+    def toggle_login(self):
+        enable = not backend.launch_at_login()
+        try:
+            backend.set_launch_at_login(enable)
+        except OSError as e:
+            self.write(f"couldn't change launch at login: {e}", "err", log="system")
+        self.write(f"launch at Windows login {'on' if enable else 'off'}", "ok", log="system")
+        self._paint_autostart()
+
+    # ---------- updates ----------
+    def check_for_update(self):
+        def work():
+            try:
+                found = backend.newer_release(VERSION)
+            except (OSError, ValueError):
+                found = None  # offline or rate-limited: try again later
+            if found:
+                self.events.put(("call", lambda: self._show_update(*found)))
+        threading.Thread(target=work, daemon=True).start()
+        self.root.after(6 * 3600 * 1000, self.check_for_update)
+
+    def _show_update(self, tag, url):
+        self.update_url = url
+        self.update_btn.set_text(f"update {tag} available ↗")
+        self.update_btn.pack(side="right", padx=(0, 10), anchor="s")
+        self.write(f"G2 Switcher {tag} is available - click 'update' in the header", "warn", log="system")
+
+    def open_update(self):
+        import webbrowser
+        webbrowser.open(getattr(self, "update_url", backend.RELEASES_URL))
 
     # ---------- Even Terminal ----------
     def toggle_et(self):
@@ -655,6 +769,9 @@ class App:
                 self.calls.pop(ev["rid"], None)
             return
 
+        if kind == "context":
+            self._set_meter(ev["used"], ev["limit"])
+            return
         where = label(call.get("provider", "claude")) if call else ""
         if kind == "request" and ev["input"].startswith("compacting"):
             call["compaction"] = True
@@ -718,6 +835,18 @@ class App:
             self._ai_phase("compacting", ev["rid"], where)
         if kind in ("done", "error"):
             self.calls.pop(ev["rid"], None)
+
+    def _set_meter(self, used, limit):
+        """Context meter: ▰▰▰▱▱ 38k / 64k (Claude: just the size - Claude Code manages that window)."""
+        if not limit:
+            self.meter.configure(text=f"context {short_ctx(used) or used}", fg=T.DIM)
+            return
+        frac = min(1.0, used / limit)
+        cells = round(frac * 10)
+        trigger = relay.compact_trigger(limit) / limit if self.settings["auto_compact"] else 0.9
+        color = T.GREEN if frac < trigger * 0.8 else T.AMBER if frac < trigger else T.RED
+        self.meter.configure(text=f"context {'▰' * cells}{'▱' * (10 - cells)} "
+                                  f"{short_ctx(used) or used} / {short_ctx(limit)}", fg=color)
 
     def _ai_phase(self, phase, rid, provider, detail=""):
         if phase != self.ai["phase"] or rid != self.ai["rid"]:
@@ -952,7 +1081,10 @@ def main():
             messagebox.showerror("G2 Switcher", f"Port {backend.RELAY_PORT} is in use by another program.")
             return
 
+    in_tray = "--tray" in sys.argv  # launched at Windows login: start hidden in the tray
     root = tk.Tk()
+    if in_tray:
+        root.withdraw()
     root.title("G2 Switcher")
     scale = root.winfo_fpixels("1i") / 96
     height = min(int(980 * scale), root.winfo_screenheight() - int(80 * scale))
@@ -961,7 +1093,9 @@ def main():
     icon = ImageTk.PhotoImage(T.make_icon(64))
     root.iconphoto(True, icon)
     blend_title_bar(root)
-    App(root, state)
+    app = App(root, state)
+    if in_tray:
+        app.tray_hint_shown = True  # no "still running in the tray" toast at login
     root.mainloop()
 
 
